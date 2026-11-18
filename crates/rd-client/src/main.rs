@@ -2,7 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, RichText, Sense, Stroke,
+    self, Align, Color32, CornerRadius, FontId, Layout, Margin, RichText, Sense, Stroke,
     TextStyle, Vec2,
 };
 use std::{
@@ -31,11 +31,18 @@ mod palette {
     pub const IDLE: Color32 = Color32::from_rgb(148, 163, 184);
 }
 
+/// App logo, embedded into the binary. Regenerate with `assets/generate_icon.py`.
+const LOGO_PNG: &[u8] = include_bytes!("../assets/icon.png");
+
+fn logo_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(LOGO_PNG).expect("embedded logo is a valid PNG")
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let app = RemoteAccessApp::new();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_TITLE)
+            .with_icon(logo_icon())
             .with_inner_size([900.0, 580.0])
             .with_min_inner_size([720.0, 500.0]),
         ..Default::default()
@@ -44,9 +51,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eframe::run_native(
         APP_TITLE,
         options,
-        Box::new(move |creation_context| {
+        Box::new(|creation_context| {
             apply_theme(&creation_context.egui_ctx);
-            Ok(Box::new(app))
+            Ok(Box::new(RemoteAccessApp::new(&creation_context.egui_ctx)))
         }),
     )?;
     Ok(())
@@ -64,10 +71,21 @@ struct RemoteAccessApp {
     /// Shown as a banner when the ID could not be loaded or saved.
     warning: Option<String>,
     copied_at: Option<f64>,
+    logo: egui::TextureHandle,
 }
 
 impl RemoteAccessApp {
-    fn new() -> Self {
+    fn new(ctx: &egui::Context) -> Self {
+        let icon = logo_icon();
+        let logo = ctx.load_texture(
+            "logo",
+            egui::ColorImage::from_rgba_unmultiplied(
+                [icon.width as usize, icon.height as usize],
+                &icon.rgba,
+            ),
+            egui::TextureOptions::LINEAR,
+        );
+
         let (device_id, warning) = match data_directory().and_then(|dir| load_or_create_device_id(&dir)) {
             Ok(id) => (id, None),
             Err(error) => (
@@ -83,6 +101,7 @@ impl RemoteAccessApp {
             remote_id: String::new(),
             warning,
             copied_at: None,
+            logo,
         }
     }
 }
@@ -219,7 +238,7 @@ impl eframe::App for RemoteAccessApp {
                     .inner_margin(Margin::symmetric(24, 14))
                     .stroke(Stroke::new(1.0_f32, palette::BORDER)),
             )
-            .show(ctx, header);
+            .show(ctx, |ui| header(ui, &self.logo));
 
         egui::TopBottomPanel::bottom("footer")
             .frame(
@@ -376,18 +395,9 @@ impl RemoteAccessApp {
     }
 }
 
-fn header(ui: &mut egui::Ui) {
+fn header(ui: &mut egui::Ui, logo: &egui::TextureHandle) {
     ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, CornerRadius::same(10), palette::ACCENT);
-        painter.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            "DR",
-            FontId::proportional(16.0),
-            Color32::WHITE,
-        );
+        ui.add(egui::Image::from_texture(logo).fit_to_exact_size(Vec2::splat(42.0)));
 
         ui.add_space(6.0);
         ui.vertical(|ui| {
