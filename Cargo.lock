@@ -2975,6 +2975,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "uuid",
+ "windows-sys 0.59.0",
  "winresource",
  "xcap",
  "zune-jpeg",

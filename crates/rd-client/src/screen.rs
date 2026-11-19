@@ -5,6 +5,10 @@
 //! changed and the viewer has acknowledged enough earlier frames, so a slow
 //! link gets fewer frames instead of an ever-growing backlog.
 //!
+//! A second thread receives the viewer's messages: frame acknowledgements go
+//! to the capture thread, and mouse/keyboard input is replayed on this PC
+//! while the host allows control.
+//!
 //! Viewer side: [`decode_jpeg`] turns a received frame into an egui image.
 
 use std::{
@@ -21,7 +25,10 @@ use eframe::egui;
 use rd_core::media::{PeerMessage, encode_screen_frame};
 use uuid::Uuid;
 
-use crate::net::NetSender;
+use crate::{
+    control::{Injector, SystemInput},
+    net::NetSender,
+};
 
 /// Target frame interval (about 10 frames per second at most).
 const FRAME_INTERVAL: Duration = Duration::from_millis(100);
@@ -33,9 +40,23 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_WIDTH: u32 = 1920;
 const JPEG_QUALITY: u8 = 60;
 
-/// Stops sharing when dropped.
+/// How often the input thread rechecks whether control was switched off.
+const CONTROL_POLL: Duration = Duration::from_millis(200);
+
+/// Stops sharing (and remote control) when dropped.
 pub struct ShareHandle {
     stop: Arc<AtomicBool>,
+    control: Arc<AtomicBool>,
+}
+
+impl ShareHandle {
+    pub fn control_allowed(&self) -> bool {
+        self.control.load(Ordering::Relaxed)
+    }
+
+    pub fn set_control_allowed(&self, allowed: bool) {
+        self.control.store(allowed, Ordering::Relaxed);
+    }
 }
 
 impl Drop for ShareHandle {
@@ -45,24 +66,64 @@ impl Drop for ShareHandle {
 }
 
 /// Starts sending this PC's screen to the viewer of `session_id`.
+/// Remote control starts allowed, since the host just approved the session.
 pub fn start_sharing(session_id: Uuid, net: NetSender) -> ShareHandle {
     let stop = Arc::new(AtomicBool::new(false));
+    let control = Arc::new(AtomicBool::new(true));
     let (peer_tx, peer_rx) = mpsc::channel();
+    let (ack_tx, ack_rx) = mpsc::channel();
     net.add_route(session_id, peer_tx);
 
+    // Ends when the route is removed (session over), which in turn closes
+    // `ack_tx` and stops the capture thread.
+    let input_control = control.clone();
+    let input = thread::Builder::new()
+        .name("remote-input".into())
+        .spawn(move || input_loop(&peer_rx, &ack_tx, &input_control));
+
     let thread_stop = stop.clone();
-    let spawned = thread::Builder::new()
+    let share = thread::Builder::new()
         .name("screen-share".into())
         .spawn(move || {
-            if let Err(error) = share_loop(session_id, &net, &peer_rx, &thread_stop) {
+            if let Err(error) = share_loop(session_id, &net, &ack_rx, &thread_stop) {
                 net.send_peer(session_id, &PeerMessage::ShareError { message: error });
             }
             net.remove_route(session_id);
         });
-    if spawned.is_err() {
+    if input.is_err() || share.is_err() {
         stop.store(true, Ordering::Relaxed);
     }
-    ShareHandle { stop }
+    ShareHandle { stop, control }
+}
+
+fn input_loop(
+    peer_rx: &mpsc::Receiver<PeerMessage>,
+    ack_tx: &mpsc::Sender<PeerMessage>,
+    control: &AtomicBool,
+) {
+    // Dropping the injector at the end releases any key or button still held.
+    let mut injector = Injector::new(SystemInput);
+    let mut was_allowed = true;
+    loop {
+        let message = match peer_rx.recv_timeout(CONTROL_POLL) {
+            Ok(message) => Some(message),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        let allowed = control.load(Ordering::Relaxed);
+        if was_allowed && !allowed {
+            injector.release_all();
+        }
+        was_allowed = allowed;
+
+        match message {
+            Some(ack @ PeerMessage::FrameAck { .. }) => {
+                let _ = ack_tx.send(ack);
+            }
+            Some(PeerMessage::Input { event }) if allowed => injector.apply(event),
+            _ => {}
+        }
+    }
 }
 
 fn share_loop(

@@ -25,6 +25,44 @@ pub enum PeerMessage {
     FrameAck { seq: u32 },
     /// The host could not share its screen.
     ShareError { message: String },
+    /// Viewer → host: mouse or keyboard input to replay on the host.
+    Input { event: InputEvent },
+    /// Host → viewer: whether the host currently lets the viewer control it.
+    ControlAllowed { allowed: bool },
+}
+
+/// Modifier keys held down with an input event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyModifiers {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+/// One input event from the viewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InputEvent {
+    /// Pointer position on the shared screen, from 0 (left/top) to 65535
+    /// (right/bottom), independent of either side's resolution.
+    MouseMove { x: u16, y: u16 },
+    MouseButton { button: MouseButton, down: bool, modifiers: KeyModifiers },
+    /// Wheel movement, 120 per notch; positive scrolls up / right.
+    Wheel { dx: i32, dy: i32 },
+    /// A key by its Windows virtual-key code (US layout position).
+    Key { vk: u16, down: bool, modifiers: KeyModifiers },
+    /// The modifier keys now held (sent whenever they change).
+    Modifiers { modifiers: KeyModifiers },
+    /// Release every key and button the viewer is holding.
+    ReleaseAll,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -83,5 +121,18 @@ mod tests {
     fn peer_messages_are_tagged() {
         let json = serde_json::to_string(&PeerMessage::FrameAck { seq: 7 }).unwrap();
         assert_eq!(json, r#"{"kind":"frame_ack","seq":7}"#);
+    }
+
+    #[test]
+    fn input_messages_round_trip() {
+        let message = PeerMessage::Input {
+            event: InputEvent::Key {
+                vk: 0x41,
+                down: true,
+                modifiers: KeyModifiers { ctrl: true, ..Default::default() },
+            },
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(serde_json::from_str::<PeerMessage>(&json).unwrap(), message);
     }
 }

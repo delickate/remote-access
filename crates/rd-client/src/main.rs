@@ -17,6 +17,7 @@ use std::{
 };
 use uuid::Uuid;
 
+mod control;
 mod net;
 mod screen;
 
@@ -104,8 +105,7 @@ struct ActiveSession {
     session_id: Uuid,
     peer_id: Uuid,
     role: Role,
-    /// Host: keeps this PC's screen streaming while the session lasts.
-    #[allow(dead_code)]
+    /// Host: streams this PC's screen and accepts control while it lasts.
     share: Option<screen::ShareHandle>,
     /// Viewer: the remote screen as last received.
     remote: RemoteScreen,
@@ -120,6 +120,11 @@ struct RemoteScreen {
     frames: u32,
     fps: f32,
     fps_window_start: f64,
+    /// The viewer switched remote control off.
+    view_only: bool,
+    /// The host switched remote control off.
+    host_blocked: bool,
+    forwarder: control::Forwarder,
 }
 
 struct RemoteAccessApp {
@@ -305,10 +310,16 @@ impl RemoteAccessApp {
                     }
                 }
                 net::NetEvent::Peer { session_id, message } => {
-                    if let PeerMessage::ShareError { message } = message
-                        && let Some(session) = self.viewer_session_mut(session_id)
-                    {
-                        session.remote.error = Some(message);
+                    let Some(session) = self.viewer_session_mut(session_id) else {
+                        continue;
+                    };
+                    match message {
+                        PeerMessage::ShareError { message } => session.remote.error = Some(message),
+                        PeerMessage::ControlAllowed { allowed } => {
+                            session.remote.host_blocked = !allowed;
+                            session.remote.forwarder = control::Forwarder::default();
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -430,7 +441,7 @@ impl RemoteAccessApp {
                 }
                 self.notice = Some((message, palette::WARNING));
             }
-            // Screen and input traffic arrives here in the next step.
+            // Peer messages are unpacked by the network thread.
             ServerMessage::Relay { .. } | ServerMessage::Pong => {}
         }
     }
@@ -759,6 +770,7 @@ impl RemoteAccessApp {
 
     fn sessions_card(&mut self, ui: &mut egui::Ui) {
         let mut to_end = None;
+        let net = &self.net.sender;
         card_with_height(ui, 0.0, |ui| {
             ui.label(RichText::new("SESSIONS").small().strong().color(palette::ACCENT_SOFT));
             for session in &self.sessions {
@@ -772,12 +784,23 @@ impl RemoteAccessApp {
                         if ui.button("End").clicked() {
                             to_end = Some(session.session_id);
                         }
+                        if let Some(share) = &session.share {
+                            let mut allowed = share.control_allowed();
+                            if ui.checkbox(&mut allowed, "Allow control").changed() {
+                                share.set_control_allowed(allowed);
+                                net.send_peer(
+                                    session.session_id,
+                                    &PeerMessage::ControlAllowed { allowed },
+                                );
+                            }
+                        }
                     });
                 });
             }
             if self.sessions.iter().any(|s| s.role == Role::Host) {
                 ui.label(
-                    RichText::new("Your screen is visible to the connected device. Click End to stop sharing.")
+                    RichText::new("Your screen is visible to the connected device, and it can use your mouse and \
+                     keyboard while \"Allow control\" is ticked. Click End to stop.")
                         .small()
                         .color(palette::WARNING),
                 );
@@ -788,10 +811,13 @@ impl RemoteAccessApp {
         }
     }
 
-    /// Full-window view of the remote screen, scaled to fit.
+    /// Full-window view of the remote screen, scaled to fit. While control is
+    /// on, mouse and keyboard input over it is sent to the remote PC.
     fn remote_view(&mut self, ui: &mut egui::Ui, index: usize) {
-        let session = &self.sessions[index];
+        let net = self.net.sender.clone();
+        let session = &mut self.sessions[index];
         let session_id = session.session_id;
+        let send_input = |event| net.send_peer(session_id, &PeerMessage::Input { event });
         let mut end = false;
 
         ui.horizontal(|ui| {
@@ -812,15 +838,33 @@ impl RemoteAccessApp {
                 if ui.button("End session").clicked() {
                     end = true;
                 }
+                let remote = &mut session.remote;
+                if remote.host_blocked {
+                    ui.label(
+                        RichText::new("View only: the other side turned off control")
+                            .small()
+                            .color(palette::WARNING),
+                    );
+                } else {
+                    let mut controlling = !remote.view_only;
+                    if ui.checkbox(&mut controlling, "Control mouse & keyboard").changed() {
+                        remote.view_only = !controlling;
+                        if !controlling {
+                            remote.forwarder.release_all(&mut |event| send_input(event));
+                        }
+                    }
+                }
             });
         });
         ui.add_space(8.0);
 
         let available = ui.available_size();
-        let (rect, _) = ui.allocate_exact_size(available, Sense::hover());
+        let (rect, response) = ui.allocate_exact_size(available, Sense::click_and_drag());
         ui.painter().rect_filled(rect, CornerRadius::same(8), Color32::BLACK);
 
-        if let Some(error) = &session.remote.error {
+        let remote = &mut session.remote;
+        let mut shown = None;
+        if let Some(error) = &remote.error {
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -828,16 +872,17 @@ impl RemoteAccessApp {
                 FontId::proportional(15.0),
                 palette::WARNING,
             );
-        } else if let Some(texture) = &session.remote.texture {
+        } else if let Some(texture) = &remote.texture {
             let size = texture.size_vec2();
             let scale = (rect.width() / size.x).min(rect.height() / size.y);
-            let shown = egui::Rect::from_center_size(rect.center(), size * scale);
+            let area = egui::Rect::from_center_size(rect.center(), size * scale);
             ui.painter().image(
                 texture.id(),
-                shown,
+                area,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
+            shown = Some(area);
         } else {
             ui.painter().text(
                 rect.center(),
@@ -846,6 +891,30 @@ impl RemoteAccessApp {
                 FontId::proportional(15.0),
                 palette::MUTED,
             );
+        }
+
+        if let Some(shown) = shown
+            && !remote.view_only
+            && !remote.host_blocked
+        {
+            // Keep keyboard focus here so Tab, arrows and Esc go to the remote
+            // PC instead of moving focus to this window's buttons.
+            ui.memory_mut(|memory| {
+                memory.request_focus(response.id);
+                memory.set_focus_lock_filter(
+                    response.id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                );
+            });
+            let (events, modifiers) = ui.input(|input| (input.events.clone(), input.modifiers));
+            remote
+                .forwarder
+                .forward(&events, modifiers, shown, response.hovered(), send_input);
         }
 
         if end {
@@ -871,8 +940,9 @@ impl RemoteAccessApp {
             ui.add_space(4.0);
             ui.label(
                 RichText::new(
-                    "Only allow this if you know who it is and you expected their request. \
-                     You can end the session at any time.",
+                    "If you allow it, they will see your screen and can use your mouse and \
+                     keyboard. Only allow this if you know who it is and you expected their \
+                     request. You can end the session at any time.",
                 )
                 .color(palette::TEXT),
             );
