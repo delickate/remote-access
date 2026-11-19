@@ -1,4 +1,5 @@
 pub mod identity;
+pub mod media;
 pub mod protocol;
 
 pub fn version() -> &'static str {

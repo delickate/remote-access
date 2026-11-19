@@ -7,6 +7,7 @@ use eframe::egui::{
 };
 use rd_core::{
     identity::device_id_from_secret,
+    media::PeerMessage,
     protocol::{ClientMessage, EndReason, Role, ServerMessage},
 };
 use std::{
@@ -17,6 +18,7 @@ use std::{
 use uuid::Uuid;
 
 mod net;
+mod screen;
 
 const APP_TITLE: &str = "Delickate Remote Access";
 const COPY_FEEDBACK_SECS: f64 = 1.5;
@@ -102,6 +104,22 @@ struct ActiveSession {
     session_id: Uuid,
     peer_id: Uuid,
     role: Role,
+    /// Host: keeps this PC's screen streaming while the session lasts.
+    #[allow(dead_code)]
+    share: Option<screen::ShareHandle>,
+    /// Viewer: the remote screen as last received.
+    remote: RemoteScreen,
+}
+
+#[derive(Default)]
+struct RemoteScreen {
+    texture: Option<egui::TextureHandle>,
+    /// Newest undecoded frame; older ones are skipped if the UI falls behind.
+    pending: Option<(u32, Vec<u8>)>,
+    error: Option<String>,
+    frames: u32,
+    fps: f32,
+    fps_window_start: f64,
 }
 
 struct RemoteAccessApp {
@@ -281,7 +299,62 @@ impl RemoteAccessApp {
                     self.link = Link::Offline { reason, retrying };
                 }
                 net::NetEvent::Message(message) => self.handle_server_message(message),
+                net::NetEvent::ScreenFrame { session_id, seq, jpeg } => {
+                    if let Some(session) = self.viewer_session_mut(session_id) {
+                        session.remote.pending = Some((seq, jpeg));
+                    }
+                }
+                net::NetEvent::Peer { session_id, message } => {
+                    if let PeerMessage::ShareError { message } = message
+                        && let Some(session) = self.viewer_session_mut(session_id)
+                    {
+                        session.remote.error = Some(message);
+                    }
+                }
             }
+        }
+    }
+
+    fn viewer_session_mut(&mut self, session_id: Uuid) -> Option<&mut ActiveSession> {
+        self.sessions
+            .iter_mut()
+            .find(|s| s.session_id == session_id && s.role == Role::Viewer)
+    }
+
+    /// Decodes the newest received frame of each viewed screen, shows it, and
+    /// tells the host it may send the next one.
+    fn show_received_frames(&mut self, ctx: &egui::Context, now: f64) {
+        for session in &mut self.sessions {
+            let Some((seq, jpeg)) = session.remote.pending.take() else {
+                continue;
+            };
+            match screen::decode_jpeg(&jpeg) {
+                Ok(image) => {
+                    let remote = &mut session.remote;
+                    match &mut remote.texture {
+                        Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
+                        None => {
+                            remote.texture = Some(ctx.load_texture(
+                                format!("remote-{}", session.session_id),
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            ));
+                        }
+                    }
+                    remote.error = None;
+                    remote.frames += 1;
+                    let elapsed = now - remote.fps_window_start;
+                    if elapsed >= 1.0 {
+                        remote.fps = remote.frames as f32 / elapsed as f32;
+                        remote.frames = 0;
+                        remote.fps_window_start = now;
+                    }
+                }
+                Err(error) => session.remote.error = Some(error),
+            }
+            self.net
+                .sender
+                .send_peer(session.session_id, &PeerMessage::FrameAck { seq });
         }
     }
 
@@ -313,7 +386,15 @@ impl RemoteAccessApp {
                         palette::SUCCESS,
                     ));
                 }
-                self.sessions.push(ActiveSession { session_id, peer_id, role });
+                let share = (role == Role::Host)
+                    .then(|| screen::start_sharing(session_id, self.net.sender.clone()));
+                self.sessions.push(ActiveSession {
+                    session_id,
+                    peer_id,
+                    role,
+                    share,
+                    remote: RemoteScreen::default(),
+                });
             }
             ServerMessage::SessionRejected { session_id } => {
                 if self.outgoing_is(session_id) {
@@ -453,6 +534,7 @@ impl eframe::App for RemoteAccessApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_network_events();
         let now = ctx.input(|input| input.time);
+        self.show_received_frames(ctx, now);
 
         egui::TopBottomPanel::top("header")
             .frame(
@@ -490,6 +572,10 @@ impl eframe::App for RemoteAccessApp {
                     .inner_margin(Margin::same(24)),
             )
             .show(ctx, |ui| {
+                if let Some(index) = self.sessions.iter().position(|s| s.role == Role::Viewer) {
+                    self.remote_view(ui, index);
+                    return;
+                }
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     if let Some(warning) = &self.warning {
                         banner(ui, warning);
@@ -689,9 +775,80 @@ impl RemoteAccessApp {
                     });
                 });
             }
-            note(ui, "Screen sharing and remote control are coming in the next step.");
+            if self.sessions.iter().any(|s| s.role == Role::Host) {
+                ui.label(
+                    RichText::new("Your screen is visible to the connected device. Click End to stop sharing.")
+                        .small()
+                        .color(palette::WARNING),
+                );
+            }
         });
         if let Some(session_id) = to_end {
+            self.end_session(session_id);
+        }
+    }
+
+    /// Full-window view of the remote screen, scaled to fit.
+    fn remote_view(&mut self, ui: &mut egui::Ui, index: usize) {
+        let session = &self.sessions[index];
+        let session_id = session.session_id;
+        let mut end = false;
+
+        ui.horizontal(|ui| {
+            status_pill(ui, "Viewing", palette::SUCCESS);
+            ui.label(
+                RichText::new(format!("Screen of {}", session.peer_id))
+                    .strong()
+                    .color(palette::TEXT),
+            );
+            if session.remote.texture.is_some() {
+                ui.label(
+                    RichText::new(format!("{:.0} fps", session.remote.fps))
+                        .small()
+                        .color(palette::MUTED),
+                );
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("End session").clicked() {
+                    end = true;
+                }
+            });
+        });
+        ui.add_space(8.0);
+
+        let available = ui.available_size();
+        let (rect, _) = ui.allocate_exact_size(available, Sense::hover());
+        ui.painter().rect_filled(rect, CornerRadius::same(8), Color32::BLACK);
+
+        if let Some(error) = &session.remote.error {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                error,
+                FontId::proportional(15.0),
+                palette::WARNING,
+            );
+        } else if let Some(texture) = &session.remote.texture {
+            let size = texture.size_vec2();
+            let scale = (rect.width() / size.x).min(rect.height() / size.y);
+            let shown = egui::Rect::from_center_size(rect.center(), size * scale);
+            ui.painter().image(
+                texture.id(),
+                shown,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Waiting for the first frame…",
+                FontId::proportional(15.0),
+                palette::MUTED,
+            );
+        }
+
+        if end {
             self.end_session(session_id);
         }
     }
