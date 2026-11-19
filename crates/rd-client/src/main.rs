@@ -122,8 +122,9 @@ struct RemoteScreen {
     fps_window_start: f64,
     /// The viewer switched remote control off.
     view_only: bool,
-    /// The host switched remote control off.
-    host_blocked: bool,
+    /// Whether the host allows control: `None` until it says so (an older
+    /// host never does, as it cannot be controlled).
+    host_control: Option<bool>,
     forwarder: control::Forwarder,
 }
 
@@ -316,7 +317,7 @@ impl RemoteAccessApp {
                     match message {
                         PeerMessage::ShareError { message } => session.remote.error = Some(message),
                         PeerMessage::ControlAllowed { allowed } => {
-                            session.remote.host_blocked = !allowed;
+                            session.remote.host_control = Some(allowed);
                             session.remote.forwarder = control::Forwarder::default();
                         }
                         _ => {}
@@ -397,8 +398,15 @@ impl RemoteAccessApp {
                         palette::SUCCESS,
                     ));
                 }
-                let share = (role == Role::Host)
-                    .then(|| screen::start_sharing(session_id, self.net.sender.clone()));
+                let share = (role == Role::Host).then(|| {
+                    let share = screen::start_sharing(session_id, self.net.sender.clone());
+                    // Tells the viewer this version can be controlled.
+                    self.net.sender.send_peer(
+                        session_id,
+                        &PeerMessage::ControlAllowed { allowed: share.control_allowed() },
+                    );
+                    share
+                });
                 self.sessions.push(ActiveSession {
                     session_id,
                     peer_id,
@@ -565,7 +573,11 @@ impl eframe::App for RemoteAccessApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(rd_core::version()).small().color(palette::MUTED));
+                    ui.label(
+                        RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                            .small()
+                            .color(palette::MUTED),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(
                             RichText::new(format!("Server: {}", self.server_url))
@@ -839,18 +851,30 @@ impl RemoteAccessApp {
                     end = true;
                 }
                 let remote = &mut session.remote;
-                if remote.host_blocked {
-                    ui.label(
-                        RichText::new("View only: the other side turned off control")
+                match remote.host_control {
+                    None => {
+                        ui.label(
+                            RichText::new(
+                                "View only: the other PC must run the latest version of this app to be controlled",
+                            )
                             .small()
                             .color(palette::WARNING),
-                    );
-                } else {
-                    let mut controlling = !remote.view_only;
-                    if ui.checkbox(&mut controlling, "Control mouse & keyboard").changed() {
-                        remote.view_only = !controlling;
-                        if !controlling {
-                            remote.forwarder.release_all(&mut |event| send_input(event));
+                        );
+                    }
+                    Some(false) => {
+                        ui.label(
+                            RichText::new("View only: the other side turned off control")
+                                .small()
+                                .color(palette::WARNING),
+                        );
+                    }
+                    Some(true) => {
+                        let mut controlling = !remote.view_only;
+                        if ui.checkbox(&mut controlling, "Control mouse & keyboard").changed() {
+                            remote.view_only = !controlling;
+                            if !controlling {
+                                remote.forwarder.release_all(&mut |event| send_input(event));
+                            }
                         }
                     }
                 }
@@ -895,7 +919,7 @@ impl RemoteAccessApp {
 
         if let Some(shown) = shown
             && !remote.view_only
-            && !remote.host_blocked
+            && remote.host_control == Some(true)
         {
             // Keep keyboard focus here so Tab, arrows and Esc go to the remote
             // PC instead of moving focus to this window's buttons.
